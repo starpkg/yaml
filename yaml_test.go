@@ -6,6 +6,7 @@ package yaml
 //   - decode / encode round-trip
 //   - bare-timestamp taming
 //   - capwalk limits (depth / nodes / input bytes)
+//   - defensive / error arms (unsupported toStarlark type, encode failure)
 
 import (
 	"strings"
@@ -145,5 +146,34 @@ func TestTimestampValueGoLevel(t *testing.T) {
 	}
 	if _, ok := v.(*starlark.Dict); !ok {
 		t.Errorf("map should convert to dict, got %T", v)
+	}
+}
+
+// --- defensive / error arms --------------------------------------------------
+
+func TestToStarlarkUnsupportedType(t *testing.T) {
+	// A Go value whose type the decode switch does not handle (e.g. a struct)
+	// must hit the default arm and surface the "unsupported value" error rather
+	// than silently producing a wrong value.
+	type unsupported struct{ A int }
+	nodes := 0
+	_, err := toStarlark(unsupported{A: 1}, 1, &nodes, 64, 1000)
+	if err == nil || !strings.Contains(err.Error(), "unsupported value of type") {
+		t.Errorf("expected unsupported-value error, got %v", err)
+	}
+}
+
+func TestEncodeNonMarshalable(t *testing.T) {
+	// A self-referential (cyclic) list cannot be unmarshalled into a Go value,
+	// so encode() must surface a "yaml.encode" error instead of panicking.
+	cyclic := starlark.NewList(nil)
+	if err := cyclic.Append(cyclic); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	m := NewModule()
+	b := starlark.NewBuiltin(ModuleName+".encode", m.encode)
+	_, err := m.encode(&starlark.Thread{}, b, starlark.Tuple{cyclic}, nil)
+	if err == nil || !strings.Contains(err.Error(), "yaml.encode") {
+		t.Errorf("expected yaml.encode error, got %v", err)
 	}
 }
