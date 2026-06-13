@@ -39,6 +39,28 @@ doc["nested"]["k"]     # => "v"
 encode({"a": 1, "b": [1, 2]})   # => "a: 1\nb:\n    - 1\n    - 2\n"
 ```
 
+### Anchors, aliases, and merge keys
+
+YAML's cross-reference features resolve through `decode` — an alias reuses an
+anchored value, and a merge key (`<<`) inherits an anchored mapping while
+allowing per-key overrides:
+
+```python
+doc = decode("""
+defaults: &d
+  timeout: 30
+  retries: 3
+prod:
+  <<: *d        # inherit defaults
+  timeout: 60   # override
+""")
+doc["prod"]["timeout"]   # => 60  (overridden)
+doc["prod"]["retries"]   # => 3   (inherited)
+```
+
+Runaway alias expansion (a "billion laughs" bomb) is rejected as an error, not
+an out-of-memory crash.
+
 ## Hardening
 
 - **Bare timestamps are strings.** A scalar that YAML would parse into a date or
