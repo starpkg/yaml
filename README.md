@@ -1,6 +1,7 @@
 # 📄 `yaml` — YAML for Starlark
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/starpkg/yaml.svg)](https://pkg.go.dev/github.com/starpkg/yaml)
+[![license](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Decode and encode [YAML](https://yaml.org/) from Starlark, built on
 [gopkg.in/yaml.v3](https://gopkg.in/yaml.v3).
@@ -8,18 +9,74 @@ Decode and encode [YAML](https://yaml.org/) from Starlark, built on
 Decoding is **hardened**: input size, nesting depth, and total node count are
 bounded; parse panics become errors; and YAML's bare-timestamp footgun is tamed.
 
+> **Where this fits.** `starpkg` is support for necessary **local** operations
+> plus simple abstractions over common **online** services, for ease of use.
+> `yaml` is a **local** capability — a pure in-process text↔value codec with no
+> network, filesystem, or external service involved.
+
 ## Installation
 
 ```bash
 go get github.com/starpkg/yaml
 ```
 
+## Wiring the module
+
+The host constructs a `Module` and hands its `LoadModule()` loader to a Starlet
+machine; the script reaches it through `load("yaml", ...)`.
+
+```go
+package main
+
+import (
+    "github.com/1set/starlet"
+    "github.com/starpkg/yaml"
+)
+
+func main() {
+    m := yaml.NewModule()
+    interp := starlet.NewWithLoaders(nil, nil, starlet.ModuleLoaderMap{
+        yaml.ModuleName: m.LoadModule(),
+    })
+    _, _ = interp.RunScript([]byte(`
+load("yaml", "decode", "encode")
+print(decode("a: 1")["a"])
+`), nil)
+}
+```
+
+`NewModule()` reads the decode caps (`max_depth` / `max_nodes` /
+`max_input_bytes`) from defaults or the `YAML_*` environment variables — see
+[Configuration](#configuration). `ModuleName` is the constant `"yaml"`.
+
 ## Functions
+
+The module exposes two script-facing builtins. There are no object methods:
+`decode` returns plain Starlark values (`dict` / `list` / `str` / `int` /
+`float` / `bool` / `None`) and `encode` returns a `str`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `decode` | `decode(text) -> value` | Parse YAML into Starlark values (dict/list/str/int/float/bool/None). |
+| `decode` | `decode(text) -> value` | Parse a YAML document into Starlark values. |
 | `encode` | `encode(value) -> str` | Serialize a Starlark value to YAML text. |
+
+### `decode(text)`
+
+Parses a YAML document and returns Starlark values. `text` may be a `str` or
+`bytes`. A YAML mapping becomes a `dict` (string keys; non-string keys are
+stringified), a sequence becomes a `list`, and scalars become `None` / `bool` /
+`int` / `float` / `str`. A scalar YAML would parse as a date or datetime is
+returned as an RFC 3339 `str` (see [Hardening](#hardening)). Anchors, aliases,
+and merge keys (`<<`) are resolved by the parser. Raises an error when the input
+exceeds a cap, the document is malformed, or it decodes to an unsupported type.
+
+### `encode(value)`
+
+Serializes a Starlark `value` to a YAML `str`. The value is first lowered to a
+Go value (via Starlet's `dataconv.Unmarshal`), then marshalled with
+`gopkg.in/yaml.v3`. Mapping keys are emitted in sorted order. Raises an error if
+the value cannot be lowered (e.g. a self-referential/cyclic container) or
+marshalled.
 
 ## Usage
 
