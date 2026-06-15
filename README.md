@@ -65,7 +65,7 @@ The module exposes two script-facing builtins. There are no object methods:
 Parses a YAML document and returns Starlark values. `text` may be a `str` or
 `bytes`. A YAML mapping becomes a `dict` (string keys; non-string keys are
 stringified), a sequence becomes a `list`, and scalars become `None` / `bool` /
-`int` / `float` / `str`. A scalar YAML would parse as a date or datetime is
+`int` / `float` / `str`. A scalar that YAML would parse as a date or datetime is
 returned as an RFC 3339 `str` (see [Hardening](#hardening)). Anchors, aliases,
 and merge keys (`<<`) are resolved by the parser. Raises an error when the input
 exceeds a cap, the document is malformed, or it decodes to an unsupported type.

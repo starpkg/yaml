@@ -7,6 +7,8 @@ package yaml
 //   - bare-timestamp taming
 //   - capwalk limits (depth / nodes / input bytes)
 //   - defensive / error arms (unsupported toStarlark type, encode failure)
+//   - anchors / aliases / merge keys
+//   - comprehensive document + round-trip
 
 import (
 	"strings"
