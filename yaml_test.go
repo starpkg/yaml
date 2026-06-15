@@ -144,15 +144,24 @@ decode("a: 12345678901234567890")
 	}
 }
 
-func TestTimestampValueGoLevel(t *testing.T) {
-	// Sanity: a time.Time becomes an RFC3339 string through toStarlark.
+func TestStringKeyMapToDict(t *testing.T) {
+	// A string-keyed Go map converts to a Starlark dict carrying the same
+	// key/value (the happy path of the map[string]interface{} arm).
 	nodes := 0
 	v, err := toStarlark(map[string]interface{}{"only": "x"}, 1, &nodes, 64, 1000)
 	if err != nil {
 		t.Fatalf("toStarlark: %v", err)
 	}
-	if _, ok := v.(*starlark.Dict); !ok {
-		t.Errorf("map should convert to dict, got %T", v)
+	d, ok := v.(*starlark.Dict)
+	if !ok {
+		t.Fatalf("map should convert to dict, got %T", v)
+	}
+	got, found, err := d.Get(starlark.String("only"))
+	if err != nil || !found {
+		t.Fatalf("dict missing key \"only\" (found=%v, err=%v)", found, err)
+	}
+	if s, _ := starlark.AsString(got); s != "x" {
+		t.Errorf("dict[\"only\"] = %v, want \"x\"", got)
 	}
 }
 
