@@ -3,7 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/starpkg/yaml.svg)](https://pkg.go.dev/github.com/starpkg/yaml)
 [![license](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![codecov](https://codecov.io/gh/starpkg/yaml/graph/badge.svg)](https://codecov.io/gh/starpkg/yaml)
-![binary footprint](https://img.shields.io/badge/binary_footprint-%2B0.4_MB-blue)
+![binary footprint](https://img.shields.io/badge/binary_footprint-%2B0.6_MB-blue)
 
 Decode and encode [YAML](https://yaml.org/) from Starlark, built on
 [gopkg.in/yaml.v3](https://gopkg.in/yaml.v3).
