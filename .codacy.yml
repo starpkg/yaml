@@ -4,3 +4,6 @@
 exclude_paths:
   - "**/*_test.go"
   - "*_test.go"
+  # The API reference legitimately repeats method-name headings and uses
+  # tables, which markdownlint flags; doccov validates its substance instead.
+  - "docs/**"
