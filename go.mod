@@ -3,14 +3,14 @@ module github.com/starpkg/yaml
 go 1.19
 
 require (
-	github.com/1set/starlet v0.2.2
-	github.com/starpkg/base v0.1.1
+	github.com/1set/starlet v0.2.3
+	github.com/starpkg/base v0.1.2
 	go.starlark.net v0.0.0-20260324133313-ffb3f39dd27a
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
-	github.com/1set/starlight v0.2.0 // indirect
+	github.com/1set/starlight v0.2.1 // indirect
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/h2so5/here v0.0.0-20200815043652-5e14eb691fae // indirect

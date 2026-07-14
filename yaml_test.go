@@ -14,10 +14,8 @@ package yaml
 //   - cap configuration (disabled byte cap, byte-not-rune counting)
 
 import (
-	"math"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/1set/starlet"
 	"go.starlark.net/starlark"
@@ -114,21 +112,20 @@ v2 = doc["2"]
 // --- capwalk limits ----------------------------------------------------------
 
 func TestCapDepth(t *testing.T) {
-	// [[[1]]] is depth 3; cap at 2 must reject.
-	nested := []interface{}{[]interface{}{[]interface{}{int(1)}}}
-	nodes := 0
-	if _, err := toStarlark(nested, 1, &nodes, 2, 1000); err == nil || !strings.Contains(err.Error(), "max_depth") {
+	// A 3-level nested list exceeds a max_depth of 2.
+	t.Setenv("YAML_MAX_DEPTH", "2")
+	_, err := run(t, `load("yaml", "decode")
+decode("[[[1]]]")`)
+	if err == nil || !strings.Contains(err.Error(), "max_depth") {
 		t.Errorf("expected max_depth error, got %v", err)
 	}
 }
 
 func TestCapNodes(t *testing.T) {
-	list := make([]interface{}, 10)
-	for i := range list {
-		list[i] = int(i)
-	}
-	nodes := 0
-	if _, err := toStarlark(list, 1, &nodes, 64, 3); err == nil || !strings.Contains(err.Error(), "max_nodes") {
+	t.Setenv("YAML_MAX_NODES", "3")
+	_, err := run(t, `load("yaml", "decode")
+decode("[0, 1, 2, 3, 4, 5]")`)
+	if err == nil || !strings.Contains(err.Error(), "max_nodes") {
 		t.Errorf("expected max_nodes error, got %v", err)
 	}
 }
@@ -145,37 +142,45 @@ decode("a: 12345678901234567890")
 }
 
 func TestStringKeyMapToDict(t *testing.T) {
-	// A string-keyed Go map converts to a Starlark dict carrying the same
-	// key/value (the happy path of the map[string]interface{} arm).
-	nodes := 0
-	v, err := toStarlark(map[string]interface{}{"only": "x"}, 1, &nodes, 64, 1000)
+	// A string-keyed mapping decodes to a Starlark dict carrying the same key/value.
+	res, err := run(t, `load("yaml", "decode")
+d = decode("only: x")
+v = d["only"]`)
 	if err != nil {
-		t.Fatalf("toStarlark: %v", err)
+		t.Fatalf("decode: %v", err)
 	}
-	d, ok := v.(*starlark.Dict)
-	if !ok {
-		t.Fatalf("map should convert to dict, got %T", v)
-	}
-	got, found, err := d.Get(starlark.String("only"))
-	if err != nil || !found {
-		t.Fatalf("dict missing key \"only\" (found=%v, err=%v)", found, err)
-	}
-	if s, _ := starlark.AsString(got); s != "x" {
-		t.Errorf("dict[\"only\"] = %v, want \"x\"", got)
+	if res["v"] != "x" {
+		t.Errorf("decode(only: x)[\"only\"] = %v, want \"x\"", res["v"])
 	}
 }
 
-// --- defensive / error arms --------------------------------------------------
+// --- decode correctness (STAR-77): key collisions, sub-second timestamps ------
 
-func TestToStarlarkUnsupportedType(t *testing.T) {
-	// A Go value whose type the decode switch does not handle (e.g. a struct)
-	// must hit the default arm and surface the "unsupported value" error rather
-	// than silently producing a wrong value.
-	type unsupported struct{ A int }
-	nodes := 0
-	_, err := toStarlark(unsupported{A: 1}, 1, &nodes, 64, 1000)
-	if err == nil || !strings.Contains(err.Error(), "unsupported value of type") {
-		t.Errorf("expected unsupported-value error, got %v", err)
+func TestDecodeCorrectness(t *testing.T) {
+	// Non-string keys that collapse to the same Starlark string key (the float 1.0
+	// and the int 1 both stringify to "1") are REJECTED rather than silently
+	// dropping one — the STAR-77 data-loss bug.
+	_, err := run(t, `load("yaml", "decode")
+decode("1.0: a\n1: b\n")`)
+	if err == nil || !strings.Contains(err.Error(), "collide") {
+		t.Errorf("colliding non-string keys should be rejected, got %v", err)
+	}
+
+	// A genuine duplicate key is likewise rejected, never silently dropped.
+	_, err = run(t, `load("yaml", "decode")
+decode("'1': a\n1: b\n")`)
+	if err == nil {
+		t.Error("duplicate keys should be rejected, not silently dropped")
+	}
+
+	// A timestamp keeps its sub-second precision (RFC 3339 Nano, not truncated).
+	res, err := run(t, `load("yaml", "decode")
+ts = decode("t: 2020-01-02T03:04:05.5Z")["t"]`)
+	if err != nil {
+		t.Fatalf("timestamp decode: %v", err)
+	}
+	if res["ts"] != "2020-01-02T03:04:05.5Z" {
+		t.Errorf("timestamp = %v, want sub-second precision preserved", res["ts"])
 	}
 }
 
@@ -321,94 +326,62 @@ same_e = again["e"] == True
 
 // --- scalar arm coverage -----------------------------------------------------
 
-// TestToStarlarkScalarArms drives every scalar arm of toStarlark directly at
-// the Go level (yaml.v3 hands us int/int64/uint64/float64/string/nil/bool/
-// time.Time) and asserts each maps to the right Starlark value. This pins the
-// behaviour of arms that the parser rarely produces (uint64 for values above
-// math.MaxInt64, int64 for ordinary integers) and confirms the time.Time arm
-// formats as RFC 3339.
-func TestToStarlarkScalarArms(t *testing.T) {
-	ts := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
-	cases := []struct {
-		name string
-		in   interface{}
-		want string // String() of the resulting starlark.Value
-	}{
-		{"nil", nil, "None"},
-		{"bool-true", true, "True"},
-		{"bool-false", false, "False"},
-		{"int", int(7), "7"},
-		{"int-negative", int(-7), "-7"},
-		{"int64", int64(9223372036854775807), "9223372036854775807"},
-		{"uint64-overflow", uint64(18446744073709551615), "18446744073709551615"},
-		{"float64", float64(1.5), "1.5"},
-		{"float64-inf", math.Inf(1), "+inf"},
-		{"string", "hello", `"hello"`},
-		{"time", ts, `"2020-01-02T03:04:05Z"`},
+// TestDecodeScalarArms drives every scalar tag through decode and asserts each
+// maps to the right Starlark value, including uint64 (above math.MaxInt64) and a
+// whole-second timestamp (RFC 3339).
+func TestDecodeScalarArms(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"null", "null", "None"},
+		{"bool-true", "true", "True"},
+		{"bool-false", "false", "False"},
+		{"int", "7", "7"},
+		{"int-negative", "-7", "-7"},
+		{"int64-max", "9223372036854775807", "9223372036854775807"},
+		{"uint64", "18446744073709551615", "18446744073709551615"},
+		{"float", "1.5", "1.5"},
+		{"float-inf", ".inf", "+inf"},
+		{"string", "hello", "hello"},
+		{"time", "2020-01-02T03:04:05Z", "2020-01-02T03:04:05Z"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			nodes := 0
-			v, err := toStarlark(tc.in, 1, &nodes, 64, 1000)
+			res, err := run(t, `load("yaml", "decode")
+s = str(decode("v: `+tc.in+`")["v"])`)
 			if err != nil {
-				t.Fatalf("toStarlark(%v): %v", tc.in, err)
+				t.Fatalf("decode(%s): %v", tc.in, err)
 			}
-			if got := v.String(); got != tc.want {
-				t.Errorf("toStarlark(%v) = %s, want %s", tc.in, got, tc.want)
-			}
-			if nodes != 1 {
-				t.Errorf("scalar should count as exactly 1 node, got %d", nodes)
+			if res["s"] != tc.want {
+				t.Errorf("decode(v: %s) str = %v, want %s", tc.in, res["s"], tc.want)
 			}
 		})
 	}
 }
 
-// TestToStarlarkNestedErrorPropagation confirms that a cap violation reached
-// only through recursion (inside a list element, a string-keyed map value, and
-// a non-string-keyed map value) is surfaced as an error rather than swallowed.
-func TestToStarlarkNestedErrorPropagation(t *testing.T) {
-	cases := []struct {
-		name string
-		in   interface{}
-	}{
-		{"in-list", []interface{}{[]interface{}{[]interface{}{int(1)}}}},
-		{"in-string-key-map", map[string]interface{}{"a": map[string]interface{}{"b": map[string]interface{}{"c": int(1)}}}},
-		{"in-int-key-map", map[interface{}]interface{}{1: map[interface{}]interface{}{2: map[interface{}]interface{}{3: int(1)}}}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			nodes := 0
-			// maxDepth 2 rejects anything at depth 3.
-			if _, err := toStarlark(tc.in, 1, &nodes, 2, 1000); err == nil || !strings.Contains(err.Error(), "max_depth") {
-				t.Errorf("expected max_depth error from nested value, got %v", err)
-			}
-		})
+// TestDecodeNestedCapPropagation confirms a cap violation reached only through
+// recursion (a list element, a mapping value) surfaces as an error.
+func TestDecodeNestedCapPropagation(t *testing.T) {
+	t.Setenv("YAML_MAX_DEPTH", "2")
+	for _, in := range []string{"[[[1]]]", "{a: {b: {c: 1}}}"} {
+		_, err := run(t, `load("yaml", "decode")
+decode("`+in+`")`)
+		if err == nil || !strings.Contains(err.Error(), "max_depth") {
+			t.Errorf("decode(%s): expected max_depth error, got %v", in, err)
+		}
 	}
 }
 
-// TestToStarlarkIntKeyMapSorted confirms the non-string-key map arm stringifies
-// keys and materializes them in sorted order (deterministic-order invariant).
-func TestToStarlarkIntKeyMapSorted(t *testing.T) {
-	nodes := 0
-	v, err := toStarlark(map[interface{}]interface{}{
-		2: "b", 10: "j", 1: "a",
-	}, 1, &nodes, 64, 1000)
+// TestDecodeIntKeyMapSorted confirms an integer-keyed mapping materializes keys
+// in deterministic (stringified, sorted) order.
+func TestDecodeIntKeyMapSorted(t *testing.T) {
+	res, err := run(t, `load("yaml", "decode")
+d = decode("2: b\n10: j\n1: a\n")
+order = ",".join([str(k) for k in d.keys()])`)
 	if err != nil {
-		t.Fatalf("toStarlark: %v", err)
-	}
-	d, ok := v.(*starlark.Dict)
-	if !ok {
-		t.Fatalf("want *starlark.Dict, got %T", v)
-	}
-	var keys []string
-	for _, k := range d.Keys() {
-		s, _ := starlark.AsString(k)
-		keys = append(keys, s)
+		t.Fatalf("decode: %v", err)
 	}
 	// Lexicographic stringified order: "1" < "10" < "2".
-	want := []string{"1", "10", "2"}
-	if strings.Join(keys, ",") != strings.Join(want, ",") {
-		t.Errorf("int-key map order = %v, want %v", keys, want)
+	if res["order"] != "1,10,2" {
+		t.Errorf("int-key map order = %v, want 1,10,2", res["order"])
 	}
 }
 
@@ -431,7 +404,7 @@ decode("a: [1, 2")
 func TestUnmarshalErrorAndMarshalError(t *testing.T) {
 	// Unmarshal of a structurally broken document returns a wrapped error.
 	if _, err := unmarshal([]byte("a: [1, 2")); err == nil || !strings.Contains(err.Error(), "yaml.decode") {
-		t.Errorf("unmarshal of malformed input: want yaml.decode error, got %v", err)
+		t.Errorf("unmarshalNode of malformed input: want yaml.decode error, got %v", err)
 	}
 	// Marshal of a value yaml.v3 cannot encode (a func) returns a wrapped error.
 	if _, err := marshal(func() {}); err == nil || !strings.Contains(err.Error(), "yaml.encode") {
@@ -568,5 +541,88 @@ b = out["b"]
 	}
 	if res["a"] != int64(1) || res["b"] != "two" {
 		t.Errorf("decode(bytes) = a:%v b:%v, want a:1 b:two", res["a"], res["b"])
+	}
+}
+
+// TestDecodeMergeSequenceAndComplexKey covers the merge-sequence and non-scalar-
+// key branches of the node converter.
+func TestDecodeMergeSequenceAndComplexKey(t *testing.T) {
+	// `<<: [*a, *b]` merges two anchored mappings; the explicit key wins.
+	res, err := run(t, `load("yaml", "decode")
+d = decode("""
+a: &a {x: 1, z: 9}
+b: &b {y: 2}
+m:
+  <<: [*a, *b]
+  z: 3
+""")["m"]
+vx = d["x"]
+vy = d["y"]
+vz = d["z"]`)
+	if err != nil {
+		t.Fatalf("merge-sequence decode: %v", err)
+	}
+	if res["vx"] != int64(1) || res["vy"] != int64(2) || res["vz"] != int64(3) {
+		t.Errorf("merge-sequence: x=%v y=%v z=%v, want 1 2 3 (explicit z wins)", res["vx"], res["vy"], res["vz"])
+	}
+}
+
+// TestDecodeEdgeScalars covers the empty-document, custom-tag, and explicit-null
+// arms of the decoder.
+func TestDecodeEdgeScalars(t *testing.T) {
+	res, err := run(t, `load("yaml", "decode")
+empty = decode("")
+custom = decode("v: !foo bar")["v"]
+nul = decode("v: ~")["v"]`)
+	if err != nil {
+		t.Fatalf("edge scalars: %v", err)
+	}
+	if res["empty"] != nil {
+		t.Errorf("decode(\"\") = %v, want None", res["empty"])
+	}
+	if res["custom"] != "bar" {
+		t.Errorf("custom-tag scalar = %v, want \"bar\"", res["custom"])
+	}
+	if res["nul"] != nil {
+		t.Errorf("decode(v: ~)[v] = %v, want None", res["nul"])
+	}
+}
+
+// TestToStarlarkUnsupportedType covers the default arm: a Go value whose type the
+// converter does not handle surfaces the "unsupported value" error.
+func TestToStarlarkUnsupportedType(t *testing.T) {
+	nodes := 0
+	if _, err := toStarlark(struct{ A int }{1}, 1, &nodes, 64, 1000); err == nil || !strings.Contains(err.Error(), "unsupported value of type") {
+		t.Errorf("expected unsupported-value error, got %v", err)
+	}
+}
+
+// TestScalarArmsDirect covers every scalar arm of the converter directly,
+// including int64/uint64 which yaml.v3's interface{} resolution rarely produces.
+func TestScalarArmsDirect(t *testing.T) {
+	cases := []struct {
+		in   interface{}
+		want string
+	}{
+		{nil, "None"},
+		{true, "True"},
+		{int(7), "7"},
+		{int64(9223372036854775807), "9223372036854775807"},
+		{uint64(18446744073709551615), "18446744073709551615"},
+		{float64(1.5), "1.5"},
+		{"hi", `"hi"`},
+	}
+	for _, c := range cases {
+		v, ok := scalarToStarlark(c.in)
+		if !ok {
+			t.Errorf("scalarToStarlark(%v): not handled", c.in)
+			continue
+		}
+		if got := v.String(); got != c.want {
+			t.Errorf("scalarToStarlark(%v) = %s, want %s", c.in, got, c.want)
+		}
+	}
+	if _, ok := scalarToStarlark([]int{1}); ok {
+		t.Error("a slice is not a scalar")
 	}
 }
