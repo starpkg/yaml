@@ -54,10 +54,7 @@ func NewModule() *Module {
 }
 
 func genConfigOption[T any](name, description string, defaultValue T) *base.ConfigOption[T] {
-	return base.NewConfigOption(defaultValue).
-		WithName(name).
-		WithDescription(description).
-		WithEnvVar("YAML_" + upper(name))
+	return base.NewNamedConfigOption(ModuleName, name, description, defaultValue)
 }
 
 // LoadModule returns the Starlark module loader.
@@ -107,7 +104,7 @@ func (m *Module) encode(thread *starlark.Thread, b *starlark.Builtin, args starl
 	return starlark.String(out), nil
 }
 
-// unmarshal parses YAML, recovering panics into errors.
+// unmarshal parses YAML into a generic value, recovering panics into errors.
 func unmarshal(data []byte) (v interface{}, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -144,82 +141,118 @@ func toStarlark(v interface{}, depth int, nodes *int, maxDepth, maxNodes int) (s
 	if *nodes > maxNodes {
 		return nil, fmt.Errorf("yaml.decode: node count exceeds max_nodes (%d)", maxNodes)
 	}
+	if sv, ok := scalarToStarlark(v); ok {
+		return sv, nil
+	}
 	switch x := v.(type) {
-	case nil:
-		return starlark.None, nil
-	case bool:
-		return starlark.Bool(x), nil
-	case int:
-		return starlark.MakeInt(x), nil
-	case int64:
-		return starlark.MakeInt64(x), nil
-	case uint64:
-		return starlark.MakeUint64(x), nil
-	case float64:
-		return starlark.Float(x), nil
-	case string:
-		return starlark.String(x), nil
-	case time.Time:
-		// Tame YAML's bare-timestamp footgun: surface as an RFC 3339 string.
-		return starlark.String(x.Format(time.RFC3339)), nil
 	case []interface{}:
-		elems := make([]starlark.Value, 0, len(x))
-		for _, e := range x {
-			sv, err := toStarlark(e, depth+1, nodes, maxDepth, maxNodes)
-			if err != nil {
-				return nil, err
-			}
-			elems = append(elems, sv)
-		}
-		return starlark.NewList(elems), nil
+		return seqToStarlark(x, depth, nodes, maxDepth, maxNodes)
 	case map[string]interface{}:
-		d := starlark.NewDict(len(x))
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			sv, err := toStarlark(x[k], depth+1, nodes, maxDepth, maxNodes)
-			if err != nil {
-				return nil, err
-			}
-			_ = d.SetKey(starlark.String(k), sv)
-		}
-		return d, nil
+		return stringMapToStarlark(x, depth, nodes, maxDepth, maxNodes)
 	case map[interface{}]interface{}:
-		// Non-string keys: stringify deterministically.
-		type kv struct {
-			key string
-			val interface{}
-		}
-		items := make([]kv, 0, len(x))
-		for k, val := range x {
-			items = append(items, kv{fmt.Sprintf("%v", k), val})
-		}
-		sort.Slice(items, func(i, j int) bool { return items[i].key < items[j].key })
-		d := starlark.NewDict(len(items))
-		for _, it := range items {
-			sv, err := toStarlark(it.val, depth+1, nodes, maxDepth, maxNodes)
-			if err != nil {
-				return nil, err
-			}
-			_ = d.SetKey(starlark.String(it.key), sv)
-		}
-		return d, nil
+		return anyMapToStarlark(x, depth, nodes, maxDepth, maxNodes)
 	default:
 		return nil, fmt.Errorf("yaml.decode: unsupported value of type %T", v)
 	}
 }
 
-func upper(s string) string {
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
-		}
-		out[i] = c
+// scalarToStarlark converts a YAML scalar Go value; ok is false for a container
+// or unsupported type.
+func scalarToStarlark(v interface{}) (starlark.Value, bool) {
+	switch x := v.(type) {
+	case nil:
+		return starlark.None, true
+	case bool:
+		return starlark.Bool(x), true
+	case string:
+		return starlark.String(x), true
+	case time.Time:
+		// Tame YAML's bare-timestamp footgun: surface as an RFC 3339 string, WITH
+		// sub-second precision (RFC3339Nano) so a fractional second is not lost.
+		return starlark.String(x.Format(time.RFC3339Nano)), true
 	}
-	return string(out)
+	return numericToStarlark(v)
+}
+
+// numericToStarlark converts a numeric scalar (yaml.v3 yields int/int64/uint64/
+// float64); ok is false for a non-numeric value.
+func numericToStarlark(v interface{}) (starlark.Value, bool) {
+	switch x := v.(type) {
+	case int:
+		return starlark.MakeInt(x), true
+	case int64:
+		return starlark.MakeInt64(x), true
+	case uint64:
+		return starlark.MakeUint64(x), true
+	case float64:
+		return starlark.Float(x), true
+	}
+	return nil, false
+}
+
+// seqToStarlark converts a sequence to a Starlark list.
+func seqToStarlark(x []interface{}, depth int, nodes *int, maxDepth, maxNodes int) (starlark.Value, error) {
+	elems := make([]starlark.Value, 0, len(x))
+	for _, e := range x {
+		sv, err := toStarlark(e, depth+1, nodes, maxDepth, maxNodes)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, sv)
+	}
+	return starlark.NewList(elems), nil
+}
+
+// stringMapToStarlark materializes a string-keyed map as a dict in sorted-key order.
+func stringMapToStarlark(x map[string]interface{}, depth int, nodes *int, maxDepth, maxNodes int) (starlark.Value, error) {
+	keys := make([]string, 0, len(x))
+	for k := range x {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	d := starlark.NewDict(len(keys))
+	for _, k := range keys {
+		sv, err := toStarlark(x[k], depth+1, nodes, maxDepth, maxNodes)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.SetKey(starlark.String(k), sv); err != nil {
+			return nil, err
+		}
+	}
+	return d, nil
+}
+
+// anyMapToStarlark materializes a non-string-keyed map. Keys are stringified in
+// deterministic (sorted) order; two keys that collapse to the SAME Starlark
+// string key (e.g. the float 1.0 and the int 1, both "1") are rejected rather
+// than silently dropping one — the STAR-77 data-loss bug.
+func anyMapToStarlark(x map[interface{}]interface{}, depth int, nodes *int, maxDepth, maxNodes int) (starlark.Value, error) {
+	type kv struct {
+		key string
+		val interface{}
+	}
+	items := make([]kv, 0, len(x))
+	for k, val := range x {
+		items = append(items, kv{fmt.Sprintf("%v", k), val})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].key < items[j].key })
+	seen := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		if _, dup := seen[it.key]; dup {
+			return nil, fmt.Errorf("yaml.decode: distinct map keys collide as %q after stringification", it.key)
+		}
+		seen[it.key] = struct{}{}
+	}
+	d := starlark.NewDict(len(items))
+	for _, it := range items {
+		sv, err := toStarlark(it.val, depth+1, nodes, maxDepth, maxNodes)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.SetKey(starlark.String(it.key), sv); err != nil {
+			return nil, err
+		}
+	}
+	return d, nil
 }
