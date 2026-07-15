@@ -4,7 +4,7 @@ go 1.19
 
 require (
 	github.com/1set/starlet v0.2.3
-	github.com/starpkg/base v0.1.2
+	github.com/starpkg/base v0.1.3
 	go.starlark.net v0.0.0-20260324133313-ffb3f39dd27a
 	gopkg.in/yaml.v3 v3.0.1
 )
