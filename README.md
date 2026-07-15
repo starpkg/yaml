@@ -52,9 +52,9 @@ print(encode({"b": [1, 2]}))   # => "b:\n    - 1\n    - 2\n"
 }
 ```
 
-`NewModule()` reads the decode caps (`max_depth` / `max_nodes` /
-`max_input_bytes`) from defaults or the `YAML_*` environment variables.
-`ModuleName` is the constant `"yaml"`.
+`NewModule()` reads the caps (`max_depth` / `max_nodes` / `max_input_bytes` /
+`max_time` / `max_encode_depth`) from defaults or the `YAML_*` environment
+variables. `ModuleName` is the constant `"yaml"`.
 
 ## Starlark API at a glance
 
@@ -73,9 +73,14 @@ errors, hardening notes, and examples of both builtins.
 
 ## Configuration
 
-The module's three decode caps (`max_depth`, `max_nodes`, `max_input_bytes`)
-are configured via environment variables (`YAML_*`) or per-option `get_<key>` /
-`set_<key>` accessor builtins. See the
+The decode caps (`max_depth`, `max_nodes`, `max_input_bytes`) plus two
+**host-only** DoS levers — `max_time` (a per-decode wall-clock bound;
+`max_input_bytes` bounds size but not yaml.v3's super-linear *parse* time, and a
+merge-key chain under the byte cap can be O(n²)) and `max_encode_depth` (the
+encode stack-safety fence — a value nested too deep would overflow the Go stack
+in `dataconv`/yaml.v3, so it's rejected first) — are configured via environment
+variables (`YAML_*`) or the accessor builtins. The host-only levers have no
+`set_*` (a script cannot disable them). See the
 [Configuration section of docs/API.md](docs/API.md#configuration) for the full
 option table, defaults, and accessors.
 

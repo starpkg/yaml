@@ -1,13 +1,17 @@
 // Package yaml provides a Starlark module for decoding and encoding YAML.
 //
 // Decoding is hardened against malicious documents: the input size, nesting
-// depth, and total node count are all bounded (capwalk), and parse panics are
-// recovered into errors. YAML's bare-timestamp footgun is tamed — values that
-// the parser would turn into a Go time.Time (e.g. `2020-01-01`) are surfaced as
-// RFC 3339 strings, never as a surprise opaque value.
+// depth, total node count, and parse wall-clock time are all bounded (capwalk +
+// a decode deadline for yaml.v3's super-linear parse), and parse panics are
+// recovered into errors. Encoding is fenced by max_depth so a deeply-nested
+// value can't drive marshalling into a fatal stack overflow. YAML's
+// bare-timestamp footgun is tamed — values that the parser would turn into a Go
+// time.Time (e.g. `2020-01-01`) are surfaced as RFC 3339 strings, never as a
+// surprise opaque value.
 package yaml
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -16,6 +20,8 @@ import (
 	"github.com/1set/starlet/dataconv"
 	"github.com/1set/starlet/dataconv/types"
 	"github.com/starpkg/base"
+	"github.com/starpkg/base/util"
+	startime "go.starlark.net/lib/time"
 	"go.starlark.net/starlark"
 	goyaml "gopkg.in/yaml.v3"
 )
@@ -24,18 +30,34 @@ import (
 const ModuleName = "yaml"
 
 const (
-	configKeyMaxDepth      = "max_depth"
-	configKeyMaxNodes      = "max_nodes"
-	configKeyMaxInputBytes = "max_input_bytes"
+	configKeyMaxDepth       = "max_depth"
+	configKeyMaxNodes       = "max_nodes"
+	configKeyMaxInputBytes  = "max_input_bytes"
+	configKeyMaxTime        = "max_time"
+	configKeyMaxEncodeDepth = "max_encode_depth"
 )
 
 const (
 	defaultMaxDepth      = 64
 	defaultMaxNodes      = 100000
 	defaultMaxInputBytes = 5 << 20 // 5 MiB
+	// defaultMaxTime bounds a single decode's wall-clock time. 0 = no
+	// module-level limit (still bounded by the thread context deadline, if the
+	// host set one). Default 0 keeps historical behavior.
+	defaultMaxTime = 0.0
+	// defaultMaxEncodeDepth is the stack-safety fence for encode: a value nested
+	// deeper than this is rejected before it can drive dataconv.Unmarshal or
+	// yaml.v3's Marshal into a fatal, uncatchable stack overflow. It is generous
+	// (real documents nest <100 deep) yet far below the ~millions-deep recursion
+	// that would exhaust the Go stack.
+	defaultMaxEncodeDepth = 10000
 )
 
-var none = starlark.None
+var (
+	none             = starlark.None
+	errDecodeTimeout = errors.New("yaml.decode: parsing exceeded the time limit")
+	errEncodeDepth   = errors.New("yaml.encode: value is too deeply nested to encode safely")
+)
 
 // Module wraps a ConfigurableModule with YAML functions.
 type Module struct {
@@ -49,8 +71,31 @@ func NewModule() *Module {
 		genConfigOption(configKeyMaxDepth, "Maximum nesting depth when decoding", defaultMaxDepth),
 		genConfigOption(configKeyMaxNodes, "Maximum total nodes when decoding", defaultMaxNodes),
 		genConfigOption(configKeyMaxInputBytes, "Maximum input size in bytes when decoding", defaultMaxInputBytes),
+		// max_time bounds a single decode's wall-clock time. max_nodes is a
+		// POST-parse fence — it can't bound yaml.v3's super-linear PARSE time, so a
+		// document under the byte cap can still burn CPU for a long time. HOST-ONLY:
+		// a script must not be able to disable the limit.
+		genConfigOption(configKeyMaxTime, "Maximum wall-clock seconds for a single decode (0 = no module limit)", defaultMaxTime).
+			SetHostOnly(true),
+		// max_encode_depth is a stack-safety fence, NOT the convenience max_depth
+		// cap: it must be HOST-ONLY so a script can't set_max_encode_depth(0) to
+		// disable the overflow protection. Its default is generous, so it never
+		// rejects a realistically-shaped value.
+		genConfigOption(configKeyMaxEncodeDepth, "Maximum value nesting depth when encoding (stack-safety fence)", defaultMaxEncodeDepth).
+			SetHostOnly(true),
 	)
 	return &Module{cfgMod: cm, ext: cm.Extend()}
+}
+
+func (m *Module) maxTime() float64 {
+	return m.ext.GetFloat(configKeyMaxTime, defaultMaxTime)
+}
+
+func (m *Module) maxEncodeDepth() int {
+	if v := m.ext.GetInt(configKeyMaxEncodeDepth); v > 0 {
+		return v
+	}
+	return defaultMaxEncodeDepth
 }
 
 func genConfigOption[T any](name, description string, defaultValue T) *base.ConfigOption[T] {
@@ -79,7 +124,11 @@ func (m *Module) decode(thread *starlark.Thread, b *starlark.Builtin, args starl
 	maxDepth := m.ext.GetInt(configKeyMaxDepth)
 	maxNodes := m.ext.GetInt(configKeyMaxNodes)
 
-	parsed, err := unmarshal([]byte(text.GoString()))
+	// Bound the parse's wall-clock time: max_input_bytes bounds size and
+	// max_nodes bounds the materialized result, but neither bounds yaml.v3's
+	// super-linear PARSE time. The input is an immutable []byte, so running the
+	// parse in a goroutine shares nothing with an abandoned timeout goroutine.
+	parsed, err := unmarshalBounded(thread, m.maxTime(), []byte(text.GoString()))
 	if err != nil {
 		return none, err
 	}
@@ -87,10 +136,50 @@ func (m *Module) decode(thread *starlark.Thread, b *starlark.Builtin, args starl
 	return toStarlark(parsed, 1, &nodes, maxDepth, maxNodes)
 }
 
+// unmarshalBounded runs unmarshal under a wall-clock deadline (the thread context
+// plus, if positive, max_time), returning errDecodeTimeout when it trips.
+// yaml.v3's Unmarshal is synchronous with no context support, so it runs in a
+// goroutine; on timeout the abandoned goroutine keeps parsing until yaml.v3
+// finishes (a hard CPU bound needs an OS/sandbox limit), but it only reads the
+// immutable input, sharing nothing with the caller.
+func unmarshalBounded(thread *starlark.Thread, timeout float64, data []byte) (interface{}, error) {
+	ctx, cancel := util.OpContext(thread, util.DurationFromSeconds(timeout))
+	defer cancel()
+	if ctx.Err() != nil {
+		return nil, errDecodeTimeout
+	}
+
+	type result struct {
+		v   interface{}
+		err error
+	}
+	ch := make(chan result, 1) // buffered so an abandoned goroutine never blocks
+	go func() {
+		v, err := unmarshal(data) // unmarshal recovers panics internally
+		ch <- result{v, err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-ctx.Done():
+		return nil, errDecodeTimeout
+	}
+}
+
 // encode(value) -> str
 func (m *Module) encode(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var value starlark.Value
 	if err := starlark.UnpackArgs(b.Name(), args, kwargs, "value", &value); err != nil {
+		return none, err
+	}
+	// Fence the encode by nesting depth BEFORE lowering to Go. Both
+	// dataconv.Unmarshal (below) and yaml.v3's Marshal recurse over the value, so
+	// a deeply-nested value would exhaust the Go stack (a fatal, uncatchable
+	// overflow) in one of them. checkStarlarkDepth walks the Starlark value
+	// itself — covering dicts/lists/tuples/sets and host-wrapped iterables — and
+	// bails at maxDepth+1, so the check never recurses deeper than the limit.
+	if err := checkStarlarkDepth(value, 1, m.maxEncodeDepth()); err != nil {
 		return none, err
 	}
 	goVal, err := dataconv.Unmarshal(value)
@@ -102,6 +191,75 @@ func (m *Module) encode(thread *starlark.Thread, b *starlark.Builtin, args starl
 		return none, err
 	}
 	return starlark.String(out), nil
+}
+
+// checkStarlarkDepth rejects a value whose container nesting exceeds maxDepth. It
+// mirrors the recursion of dataconv.Unmarshal (and yaml.v3's Marshal) over the
+// Starlark value — mappings, iterables, and struct/module attributes — so an
+// over-deep value is rejected before either can recurse into it. It walks
+// through the starlark.Value interface, so it also covers host-backed
+// iterables/mappings/structs a Go-type switch would miss. It returns as soon as
+// the limit is exceeded, so its own recursion is bounded by maxDepth and cannot
+// itself overflow. Scalars are handled first, so a scalar's own attribute
+// methods (a String is HasAttrs) don't make it look like a container.
+func checkStarlarkDepth(v starlark.Value, depth, maxDepth int) error {
+	if maxDepth > 0 && depth > maxDepth {
+		return errEncodeDepth
+	}
+	switch c := v.(type) {
+	case starlark.NoneType, starlark.Bool, starlark.Int, starlark.Float, starlark.String, starlark.Bytes, startime.Time:
+		return nil // leaf scalars (dataconv does not recurse into these)
+	case starlark.IterableMapping:
+		return checkMappingDepth(c, depth, maxDepth)
+	case starlark.Iterable:
+		return checkIterableDepth(c, depth, maxDepth)
+	case starlark.HasAttrs:
+		return checkAttrsDepth(c, depth, maxDepth) // struct / module / GoStruct
+	}
+	return nil
+}
+
+// checkAttrsDepth recurses into each attribute value of a struct-like value
+// (starlarkstruct.Struct / Module), mirroring dataconv's iterAttrs.
+func checkAttrsDepth(c starlark.HasAttrs, depth, maxDepth int) error {
+	for _, name := range c.AttrNames() {
+		attr, err := c.Attr(name)
+		if err != nil || attr == nil {
+			continue
+		}
+		if err := checkStarlarkDepth(attr, depth+1, maxDepth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkMappingDepth recurses into each key and value of a mapping (dict or
+// host-backed mapping) — yaml.v3 marshals both, so both add depth.
+func checkMappingDepth(c starlark.IterableMapping, depth, maxDepth int) error {
+	for _, item := range c.Items() { // item = (key, value)
+		if err := checkStarlarkDepth(item[0], depth+1, maxDepth); err != nil {
+			return err
+		}
+		if err := checkStarlarkDepth(item[1], depth+1, maxDepth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkIterableDepth recurses into each element of a non-mapping iterable
+// (list / tuple / set / host-backed slice).
+func checkIterableDepth(c starlark.Iterable, depth, maxDepth int) error {
+	it := c.Iterate()
+	defer it.Done()
+	var e starlark.Value
+	for it.Next(&e) {
+		if err := checkStarlarkDepth(e, depth+1, maxDepth); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // unmarshal parses YAML into a generic value, recovering panics into errors.
