@@ -14,11 +14,18 @@ package yaml
 //   - cap configuration (disabled byte cap, byte-not-rune counting)
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/1set/starlet"
 	"go.starlark.net/starlark"
+	"go.starlark.net/starlarkstruct"
+
+	"github.com/1set/starlight/convert"
 )
 
 func run(t *testing.T, script string) (map[string]interface{}, error) {
@@ -624,5 +631,194 @@ func TestScalarArmsDirect(t *testing.T) {
 	}
 	if _, ok := scalarToStarlark([]int{1}); ok {
 		t.Error("a slice is not a scalar")
+	}
+}
+
+// --- decode time bound + encode depth fence (PKG-27) -------------------------
+
+// mergeChainYAML builds a merge-key chain, whose parse is ~O(n²) in yaml.v3 — a
+// small document (well under the byte cap) that burns CPU during PARSING, which
+// max_nodes (a post-parse fence) cannot bound.
+func mergeChainYAML(n int) []byte {
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "a%d: &a%d\n  k: v\n", i, i)
+	}
+	sb.WriteString("merged:\n")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "  <<: *a%d\n", i)
+	}
+	return []byte(sb.String())
+}
+
+// TestDecodeTimeoutOnExpiredContext verifies the deadline path deterministically:
+// an already-expired thread context makes unmarshalBounded return the timeout
+// without parsing at all.
+func TestDecodeTimeoutOnExpiredContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	thread := &starlark.Thread{}
+	thread.SetLocal("context", ctx)
+
+	if _, err := unmarshalBounded(thread, 0, []byte("a: 1")); !errors.Is(err, errDecodeTimeout) {
+		t.Fatalf("expired context should yield errDecodeTimeout, got %v", err)
+	}
+}
+
+// TestDecodeTimeoutBoundsSlowParse verifies a super-linear parse (a merge-key
+// chain, ~O(n²)) is abandoned once max_time trips. n=2000 parses in ~hundreds of
+// ms (far above the 20ms cap; CI runners are slower, never faster), so the
+// timeout fires without CPU-timing flakiness.
+func TestDecodeTimeoutBoundsSlowParse(t *testing.T) {
+	input := mergeChainYAML(2000)
+	if len(input) > defaultMaxInputBytes {
+		t.Fatalf("test input %d should be under the byte cap %d", len(input), defaultMaxInputBytes)
+	}
+	start := time.Now()
+	_, err := unmarshalBounded(&starlark.Thread{}, 0.02, input)
+	if !errors.Is(err, errDecodeTimeout) {
+		t.Fatalf("slow parse should hit the time limit, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("timeout should fire promptly (~20ms), took %v", elapsed)
+	}
+}
+
+// TestEncodeDepthFence verifies deeply-nested values are rejected before the
+// value is lowered to Go — the check walks the Starlark value itself (covering
+// dict / list / tuple / set) and bails at maxDepth+1, so neither
+// dataconv.Unmarshal nor yaml.v3's Marshal can be driven into a fatal recursion.
+func TestEncodeDepthFence(t *testing.T) {
+	// Nest 100 deep (> the default max_depth of 64) via each container kind so the
+	// mapping arm (dict) and the iterable arm (list/tuple/set) are both exercised.
+	kinds := map[string]func(starlark.Value) starlark.Value{
+		"list":  func(c starlark.Value) starlark.Value { return starlark.NewList([]starlark.Value{c}) },
+		"tuple": func(c starlark.Value) starlark.Value { return starlark.Tuple{c} },
+		"dict": func(c starlark.Value) starlark.Value {
+			d := starlark.NewDict(1)
+			_ = d.SetKey(starlark.String("n"), c)
+			return d
+		},
+	}
+	for name, nest := range kinds {
+		var deep starlark.Value = starlark.String("leaf")
+		for i := 0; i < 100; i++ {
+			deep = nest(deep)
+		}
+		if err := checkStarlarkDepth(deep, 1, defaultMaxDepth); !errors.Is(err, errEncodeDepth) {
+			t.Fatalf("100-deep %s value should exceed max_depth, got %v", name, err)
+		}
+	}
+
+	// A deeply-nested set (hashable elements) is also rejected via the iterable arm.
+	set := starlark.NewSet(1)
+	_ = set.Insert(starlark.MakeInt(1))
+	nestedSet := starlark.NewList([]starlark.Value{starlark.NewList([]starlark.Value{set})})
+	if err := checkStarlarkDepth(nestedSet, 1, 2); !errors.Is(err, errEncodeDepth) {
+		t.Fatalf("set nested past the limit should be rejected, got %v", err)
+	}
+
+	// A shallow value passes.
+	shallow := starlark.NewDict(1)
+	_ = shallow.SetKey(starlark.String("a"), starlark.NewList([]starlark.Value{starlark.MakeInt(1)}))
+	if err := checkStarlarkDepth(shallow, 1, defaultMaxDepth); err != nil {
+		t.Fatalf("shallow value should pass the depth fence, got %v", err)
+	}
+
+	// maxDepth <= 0 disables the fence, even for a deeply-nested value.
+	var deep starlark.Value = starlark.String("leaf")
+	for i := 0; i < 100; i++ {
+		deep = starlark.NewList([]starlark.Value{deep})
+	}
+	if err := checkStarlarkDepth(deep, 1, 0); err != nil {
+		t.Fatalf("max_depth 0 should disable the fence, got %v", err)
+	}
+}
+
+// TestEncodeDepthFenceStruct verifies the fence recurses into struct/module
+// attributes — the kind that is neither Iterable nor IterableMapping yet
+// dataconv.Unmarshal still recurses into (the codex-found bypass).
+func TestEncodeDepthFenceStruct(t *testing.T) {
+	var v starlark.Value = starlark.String("leaf")
+	for i := 0; i < 100; i++ {
+		v = starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{"inner": v})
+	}
+	if err := checkStarlarkDepth(v, 1, defaultMaxDepth); !errors.Is(err, errEncodeDepth) {
+		t.Fatalf("deeply-nested struct should be rejected by the fence, got %v", err)
+	}
+	// A shallow struct passes.
+	shallow := starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{"x": starlark.MakeInt(1)})
+	if err := checkStarlarkDepth(shallow, 1, defaultMaxDepth); err != nil {
+		t.Fatalf("shallow struct should pass, got %v", err)
+	}
+}
+
+// TestEncodeDepthFenceEndToEnd drives the fence through the script API with a
+// tiny host-set max_encode_depth: a script-built deeply-nested value fails encode
+// with a stack-safety error.
+func TestEncodeDepthFenceEndToEnd(t *testing.T) {
+	t.Setenv("YAML_MAX_ENCODE_DEPTH", "5")
+	_, err := run(t, `
+load("yaml", "encode")
+def check():
+    x = "leaf"
+    for _ in range(50):
+        x = [x]
+    encode(x)
+check()
+`)
+	if err == nil || !strings.Contains(err.Error(), "too deeply nested") {
+		t.Fatalf("deeply-nested encode should fail with a stack-safety error, got %v", err)
+	}
+}
+
+// TestDoSLeversAreHostOnly verifies neither DoS lever can be disabled from a
+// script: no set_max_time / set_max_encode_depth is generated (host-only), while
+// the getters remain.
+func TestDoSLeversAreHostOnly(t *testing.T) {
+	for _, setter := range []string{"set_max_time", "set_max_encode_depth"} {
+		if _, err := run(t, `load("yaml", "`+setter+`")`); err == nil {
+			t.Errorf("%s must not be script-callable (host-only DoS lever)", setter)
+		}
+	}
+	if _, err := run(t, `
+load("yaml", "get_max_time", "get_max_encode_depth")
+def check():
+    get_max_time()
+    get_max_encode_depth()
+check()
+`); err != nil {
+		t.Fatalf("getters should be available, got %v", err)
+	}
+}
+
+// TestMaxEncodeDepthFallback verifies a non-positive configured value falls back
+// to the safe default (the fence can't be disabled by setting it to 0).
+func TestMaxEncodeDepthFallback(t *testing.T) {
+	t.Setenv("YAML_MAX_ENCODE_DEPTH", "0")
+	if got := NewModule().maxEncodeDepth(); got != defaultMaxEncodeDepth {
+		t.Errorf("max_encode_depth=0 should fall back to default %d, got %d", defaultMaxEncodeDepth, got)
+	}
+	t.Setenv("YAML_MAX_ENCODE_DEPTH", "42")
+	if got := NewModule().maxEncodeDepth(); got != 42 {
+		t.Errorf("max_encode_depth=42 should be honored, got %d", got)
+	}
+}
+
+// TestEncodeDepthFenceWrappedGoValue verifies a host-injected deeply-nested Go
+// value, wrapped as a Starlark value, is also caught — GoMap implements
+// IterableMapping and its nested values are re-wrapped, so the fence descends
+// into them (this is why the residual is near-nil, not a real gap).
+func TestEncodeDepthFenceWrappedGoValue(t *testing.T) {
+	var deep interface{} = "leaf"
+	for i := 0; i < 100; i++ {
+		deep = map[string]interface{}{"n": deep}
+	}
+	wrapped, err := convert.ToValue(deep)
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	if err := checkStarlarkDepth(wrapped, 1, defaultMaxDepth); !errors.Is(err, errEncodeDepth) {
+		t.Fatalf("deeply-nested wrapped Go map should be rejected, got %v", err)
 	}
 }

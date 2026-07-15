@@ -137,20 +137,36 @@ accessor builtins (loaded from the `yaml` module alongside the functions above):
 - **`get_<key>()`** — returns the current value of the option.
 - **`set_<key>(value)`** — sets the option (returns `None`).
 
-An option's value resolves in priority order: an explicit `set_<key>` value, the
-environment variable, then the default. These three caps are the only host
-levers; they default to generous values, so existing scripts decode/encode
-identically.
+An option's value resolves in priority order: an explicit host value, the
+environment variable, then the default. The caps default to generous values, so
+existing scripts decode/encode identically.
 
-None of the `yaml` options are secret, so every option exposes **both**
-`get_<key>` and `set_<key>`. (A secret option would expose only its `set_<key>`
-accessor — never a getter — but this module has none.)
+The `max_depth` / `max_nodes` / `max_input_bytes` caps expose **both** `get_<key>`
+and `set_<key>`. `max_time` and `max_encode_depth` are **host-only** DoS levers:
+only their getters are generated — **`set_max_time` / `set_max_encode_depth` are
+intentionally NOT exposed**, so a script cannot disable them (their values are
+snapshotted at construction, so a runtime `runtime.setenv` cannot re-widen them
+either).
+
+- **`max_time`** bounds a single **decode**'s wall-clock time. `max_input_bytes`
+  bounds input size and `max_nodes` bounds the *materialized* result, but neither
+  bounds yaml.v3's super-linear **parse** time — a merge-key chain well under the
+  byte cap can parse in O(n²).
+- **`max_encode_depth`** is the encode **stack-safety** fence: a value nested
+  deeper than this is rejected *before* it is lowered to Go, because both
+  `dataconv.Unmarshal` and yaml.v3's `Marshal` recurse over it and a deep enough
+  value would exhaust the Go stack (a fatal, uncatchable overflow). It is a
+  separate, host-only limit — **not** the convenience `max_depth` — so a script
+  can't disable the overflow protection, and its generous default never rejects a
+  realistically-shaped value.
 
 | Option | Getter | Setter | Type | Env var | Default | Description |
 |--------|--------|--------|------|---------|---------|-------------|
 | `max_depth` | `get_max_depth` | `set_max_depth` | int | `YAML_MAX_DEPTH` | `64` | Maximum nesting depth when decoding |
 | `max_nodes` | `get_max_nodes` | `set_max_nodes` | int | `YAML_MAX_NODES` | `100000` | Maximum total nodes when decoding |
 | `max_input_bytes` | `get_max_input_bytes` | `set_max_input_bytes` | int | `YAML_MAX_INPUT_BYTES` | `5242880` | Maximum input size in bytes when decoding (5 MiB) |
+| `max_time` | `get_max_time` | `set_max_time` — **host-only, not generated** | float | `YAML_MAX_TIME` | `0` | Maximum wall-clock seconds for a single decode; `0` = no module limit (still bounded by the thread context deadline) |
+| `max_encode_depth` | `get_max_encode_depth` | `set_max_encode_depth` — **host-only, not generated** | int | `YAML_MAX_ENCODE_DEPTH` | `10000` | Maximum value nesting depth when encoding (stack-safety fence; a non-positive value falls back to the default) |
 
 **Example:**
 
