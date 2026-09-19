@@ -444,29 +444,8 @@ func (w *yamlWalk) value(n *goyaml.Node, depth int) (interface{}, error) {
 	if n.Kind == goyaml.DocumentNode {
 		return w.value(n.Content[0], depth)
 	}
-	if depth > w.maxDepth {
-		return nil, fmt.Errorf("yaml.decode: nesting exceeds max_depth (%d)", w.maxDepth)
-	}
-	w.nodes++
-	if w.aliasDepth > 0 {
-		w.aliasNodes++
-	}
-	// Preserve yaml.v3's amplification guard as well as the host node cap.
-	allowed := 0.99
-	if w.nodes > 400000 {
-		allowed -= 0.89 * float64(w.nodes-400000) / 3600000
-		if allowed < 0.10 {
-			allowed = 0.10
-		}
-	}
-	if w.nodes > 1000 && float64(w.aliasNodes)/float64(w.nodes) > allowed {
-		return nil, errors.New("yaml.decode: excessive aliasing")
-	}
-	if w.nodes > w.maxNodes {
-		return nil, fmt.Errorf("yaml.decode: node count exceeds max_nodes (%d)", w.maxNodes)
-	}
-	if w.active[n] {
-		return nil, errors.New("yaml.decode: cyclic alias")
+	if err := w.account(n, depth); err != nil {
+		return nil, err
 	}
 	w.active[n] = true
 	defer delete(w.active, n)
@@ -478,24 +457,73 @@ func (w *yamlWalk) value(n *goyaml.Node, depth int) (interface{}, error) {
 	case goyaml.ScalarNode:
 		return yamlScalar(n)
 	case goyaml.SequenceNode:
-		out := make([]interface{}, 0, len(n.Content))
-		for _, child := range n.Content {
-			v, err := w.value(child, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, v)
-		}
-		return out, nil
+		return w.sequence(n, depth)
 	case goyaml.MappingNode:
 		return w.mapping(n, depth)
 	}
 	return nil, errors.New("yaml.decode: unsupported node")
 }
 
+func (w *yamlWalk) account(n *goyaml.Node, depth int) error {
+	if depth > w.maxDepth {
+		return fmt.Errorf("yaml.decode: nesting exceeds max_depth (%d)", w.maxDepth)
+	}
+	w.nodes++
+	if w.aliasDepth > 0 {
+		w.aliasNodes++
+	}
+	// Preserve yaml.v3's amplification guard as well as the host node cap.
+	allowed := aliasAllowance(w.nodes)
+	if w.nodes > 1000 && float64(w.aliasNodes)/float64(w.nodes) > allowed {
+		return errors.New("yaml.decode: excessive aliasing")
+	}
+	if w.nodes > w.maxNodes {
+		return fmt.Errorf("yaml.decode: node count exceeds max_nodes (%d)", w.maxNodes)
+	}
+	if w.active[n] {
+		return errors.New("yaml.decode: cyclic alias")
+	}
+	return nil
+}
+
+func aliasAllowance(nodes int) float64 {
+	allowed := 0.99
+	if nodes > 400000 {
+		allowed -= 0.89 * float64(nodes-400000) / 3600000
+	}
+	if allowed < 0.10 {
+		return 0.10
+	}
+	return allowed
+}
+
+func (w *yamlWalk) sequence(n *goyaml.Node, depth int) (interface{}, error) {
+	out := make([]interface{}, 0, len(n.Content))
+	for _, child := range n.Content {
+		v, err := w.value(child, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func isIntegerNode(n *goyaml.Node) bool {
+	switch n.Tag {
+	case "!!int":
+		return true
+	case "!!str":
+		return n.Style == 0
+	case "!!float":
+		return n.Style == 0 && !strings.ContainsAny(n.Value, ".eE")
+	}
+	return false
+}
+
 func yamlScalar(n *goyaml.Node) (interface{}, error) {
 	// Quoted numbers and explicitly tagged floats retain their declared types.
-	if n.Tag == "!!int" || (n.Style == 0 && (n.Tag == "!!str" || (n.Tag == "!!float" && !strings.ContainsAny(n.Value, ".eE")))) {
+	if isIntegerNode(n) {
 		text := strings.ReplaceAll(n.Value, "_", "")
 		if value, ok := new(big.Int).SetString(text, 0); ok {
 			return value, nil
@@ -550,25 +578,30 @@ func (w *yamlWalk) mapping(n *goyaml.Node, depth int) (interface{}, error) {
 		}
 		out[key] = v
 	}
-	if merge != nil {
-		v, err := w.value(merge, depth+1)
-		if err != nil {
-			return nil, err
+	return w.mergeMapping(out, merge, depth)
+}
+
+func (w *yamlWalk) mergeMapping(out map[interface{}]interface{}, merge *goyaml.Node, depth int) (interface{}, error) {
+	if merge == nil {
+		return out, nil
+	}
+	v, err := w.value(merge, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	sources, sequence := v.([]interface{})
+	if !sequence {
+		sources = []interface{}{v}
+	}
+	for _, source := range sources {
+		m, ok := source.(map[interface{}]interface{})
+		if !ok {
+			return nil, errors.New("yaml.decode: merge requires a mapping or sequence of mappings")
 		}
-		sources, sequence := v.([]interface{})
-		if !sequence {
-			sources = []interface{}{v}
-		}
-		for _, source := range sources {
-			m, ok := source.(map[interface{}]interface{})
-			if !ok {
-				return nil, errors.New("yaml.decode: merge requires a mapping or sequence of mappings")
-			}
-			// Explicit keys win; among merge sources, the first occurrence wins.
-			for key, value := range m {
-				if _, exists := out[key]; !exists {
-					out[key] = value
-				}
+		// Explicit keys win; among merge sources, the first occurrence wins.
+		for key, value := range m {
+			if _, exists := out[key]; !exists {
+				out[key] = value
 			}
 		}
 	}
@@ -590,11 +623,7 @@ func exactEncodeValue(v interface{}) interface{} {
 	case big.Int:
 		return exactYAMLInteger(v.String())
 	case []interface{}:
-		out := make([]interface{}, len(v))
-		for i, value := range v {
-			out[i] = exactEncodeValue(value)
-		}
-		return out
+		return exactEncodeSequence(v)
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(v))
 		for key, value := range v {
@@ -609,4 +638,12 @@ func exactEncodeValue(v interface{}) interface{} {
 		return out
 	}
 	return v
+}
+
+func exactEncodeSequence(v []interface{}) []interface{} {
+	out := make([]interface{}, len(v))
+	for i, value := range v {
+		out[i] = exactEncodeValue(value)
+	}
+	return out
 }
