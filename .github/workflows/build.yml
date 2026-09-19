@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: ["master"]
 
+  workflow_dispatch:
+    inputs:
+      coverage-ref:
+        description: "Exact commit SHA to measure for the initial coverage baseline"
+        required: true
+        type: string
+
 permissions: read-all
 
 jobs:
@@ -27,3 +34,27 @@ jobs:
       footprint: true
       footprint-max-mb: 3
     secrets: inherit
+
+  # Backfill real coverage for a pre-OIDC commit; do not substitute head data.
+  baseline:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.coverage-ref }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.19.x"
+      - run: go test -race -coverprofile=coverage-baseline.txt ./...
+      - uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          files: coverage-baseline.txt
+          disable_search: true
+          fail_ci_if_error: true
+          override_commit: ${{ inputs.coverage-ref }}
+          override_branch: master
