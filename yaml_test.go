@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/1set/starlet"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+	goyaml "gopkg.in/yaml.v3"
 
 	"github.com/1set/starlight/convert"
 )
@@ -243,7 +245,7 @@ echo = doc["echo"]                       # scalar alias
 }
 
 // TestAliasBombRejected confirms an alias-expansion (billion-laughs) bomb is
-// rejected as an error (by yaml.v3's guard), not an OOM or panic.
+// rejected by the node walker's amplification guard, not an OOM or panic.
 func TestAliasBombRejected(t *testing.T) {
 	_, err := run(t, `
 load("yaml", "decode")
@@ -660,24 +662,23 @@ func TestDecodeTimeoutOnExpiredContext(t *testing.T) {
 	thread := &starlark.Thread{}
 	thread.SetLocal("context", ctx)
 
-	if _, err := unmarshalBounded(thread, 0, []byte("a: 1")); !errors.Is(err, errDecodeTimeout) {
+	if _, err := unmarshalBounded(thread, 0, []byte("a: 1"), defaultMaxDepth, defaultMaxNodes); !errors.Is(err, errDecodeTimeout) {
 		t.Fatalf("expired context should yield errDecodeTimeout, got %v", err)
 	}
 }
 
-// TestDecodeTimeoutBoundsSlowParse verifies a super-linear parse (a merge-key
-// chain, ~O(n²)) is abandoned once max_time trips. n=2000 parses in ~hundreds of
-// ms (far above the 20ms cap; CI runners are slower, never faster), so the
-// timeout fires without CPU-timing flakiness.
+// TestDecodeTimeoutBoundsSlowParse covers the repeated-merge input that was
+// quadratic in the generic decoder. The bounded node walker can reject it
+// before the deadline; either rejection must finish promptly.
 func TestDecodeTimeoutBoundsSlowParse(t *testing.T) {
 	input := mergeChainYAML(2000)
 	if len(input) > defaultMaxInputBytes {
 		t.Fatalf("test input %d should be under the byte cap %d", len(input), defaultMaxInputBytes)
 	}
 	start := time.Now()
-	_, err := unmarshalBounded(&starlark.Thread{}, 0.02, input)
-	if !errors.Is(err, errDecodeTimeout) {
-		t.Fatalf("slow parse should hit the time limit, got %v", err)
+	_, err := unmarshalBounded(&starlark.Thread{}, 0.02, input, defaultMaxDepth, defaultMaxNodes)
+	if err == nil || (!errors.Is(err, errDecodeTimeout) && !strings.Contains(err.Error(), "duplicate merge")) {
+		t.Fatalf("repeated merge input must be rejected or time out, got %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("timeout should fire promptly (~20ms), took %v", elapsed)
@@ -820,5 +821,124 @@ func TestEncodeDepthFenceWrappedGoValue(t *testing.T) {
 	}
 	if err := checkStarlarkDepth(wrapped, 1, defaultMaxDepth); !errors.Is(err, errEncodeDepth) {
 		t.Fatalf("deeply-nested wrapped Go map should be rejected, got %v", err)
+	}
+}
+
+// --- exact integers across decoding, keys, aliases, merges and encoding ---
+func TestArbitraryPrecisionIntegers(t *testing.T) {
+	for _, literal := range []string{"18446744073709551616", "-18446744073709551617", "0x10000000000000000", "0b10000000000000000000000000000000000000000000000000000000000000000", "18_446_744_073_709_551_616"} {
+		script := fmt.Sprintf(`load("yaml", "decode", "encode")
+x = decode(%q)
+assert_type = type(x) == "int"
+roundtrip = decode(encode(x)) == x
+nested = decode(encode({"n": [x]}))["n"][0] == x
+value = str(x)`, literal)
+		res, err := run(t, script)
+		if err != nil {
+			t.Fatal(literal, err)
+		}
+		if res["assert_type"] != true || res["roundtrip"] != true || res["nested"] != true {
+			t.Fatalf("%s: %#v", literal, res)
+		}
+		want := "18446744073709551616"
+		if strings.HasPrefix(literal, "-") {
+			want = "-18446744073709551617"
+		}
+		if res["value"] != want {
+			t.Fatalf("%s became %v", literal, res["value"])
+		}
+	}
+	res, err := run(t, `load("yaml", "decode", "encode")
+d = decode("""
+a: &a {n: 18446744073709551616, same: first}
+b: &b {n: -18446744073709551617, same: second}
+merged: {<<: [*a, *b]}
+override: {<<: *a, n: 18446744073709551618}
+big: &big 18446744073709551619
+alias: *big
+quoted: "18446744073709551616"
+floating: !!float 18446744073709551616
+keyed: {18446744073709551616: exact}
+""")
+ok = (d["merged"]["n"] == 18446744073709551616 and d["merged"]["same"] == "first" and d["override"]["n"] == 18446744073709551618 and d["alias"] == d["big"] and type(d["quoted"]) == "string" and type(d["floating"]) == "float" and d["keyed"]["18446744073709551616"] == "exact")
+roundtrip = decode(encode(d)) == d`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res["ok"] != true || res["roundtrip"] != true {
+		t.Fatalf("alias/merge/roundtrip: %#v", res)
+	}
+	for _, doc := range []string{"18446744073709551616: a\n'18446744073709551616': b", "0x10000000000000000: a\n18446744073709551616: b"} {
+		_, err := run(t, fmt.Sprintf(`load("yaml", "decode"); decode(%q)`, doc))
+		if err == nil || !strings.Contains(err.Error(), "collide") {
+			t.Fatalf("key collision: %q: %v", doc, err)
+		}
+	}
+}
+
+func TestYAMLNodeContracts(t *testing.T) {
+	for _, doc := range []string{
+		"a: &a [*a]", "? [a, b]\n: value", "!!int invalid: value",
+		"a: {<<: 1}", "a: {<<: [1]}", "a: {<<: *missing}",
+		"a: !!int invalid", "a: 1\na: 2", "a: {<<: {}, <<: {}}",
+	} {
+		if _, err := unmarshal([]byte(doc)); err == nil {
+			t.Fatalf("invalid document accepted: %s", doc)
+		}
+	}
+	for _, doc := range []string{"a: &key name\nmap: {*key: value}", "08", "!!int 08", "!!str 18446744073709551616", "1e20"} {
+		if _, err := unmarshal([]byte(doc)); err != nil {
+			t.Fatalf("valid document %q: %v", doc, err)
+		}
+	}
+	// Explicit decode limits fence expansion before aliases allocate a result.
+	if _, err := unmarshalWithLimits([]byte("<<: {a: 1}"), 1, 100); err == nil {
+		t.Fatal("merge escaped the depth bound")
+	}
+	for _, count := range []int{400001, 4000001} {
+		walk := yamlWalk{maxDepth: 64, maxNodes: 5000000, nodes: count, active: make(map[*goyaml.Node]bool)}
+		if _, err := walk.value(&goyaml.Node{Kind: goyaml.ScalarNode, Tag: "!!int", Value: "1"}, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walk := yamlWalk{maxDepth: 64, maxNodes: 100, active: make(map[*goyaml.Node]bool)}
+	if _, err := walk.value(&goyaml.Node{Kind: 99}, 1); err == nil {
+		t.Fatal("unsupported node accepted")
+	}
+}
+
+func TestNativeCodecConversion(t *testing.T) {
+	n, _ := new(big.Int).SetString("18446744073709551616", 10)
+	for _, input := range []interface{}{*n, n, map[interface{}]interface{}{n: []interface{}{n}}, map[string]interface{}{"n": n}} {
+		out, err := marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out, n.String()) {
+			t.Fatalf("integer lost in %q", out)
+		}
+		if _, err := unmarshal([]byte(out)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, input := range []interface{}{map[string]interface{}{"n": n}, map[interface{}]interface{}{1: n}, []interface{}{n}} {
+		nodes := 0
+		if _, err := toStarlark(input, 1, &nodes, 64, 100); err != nil {
+			t.Fatal(err)
+		}
+		nodes = 0
+		if _, err := toStarlark(input, 1, &nodes, 1, 100); err == nil {
+			t.Fatal("nested conversion escaped depth bound")
+		}
+	}
+	for _, input := range []interface{}{map[string]interface{}{"n": make(chan int)}, map[interface{}]interface{}{1: make(chan int)}, []interface{}{make(chan int)}} {
+		nodes := 0
+		if _, err := toStarlark(input, 1, &nodes, 64, 100); err == nil {
+			t.Fatal("unsupported nested value accepted")
+		}
+	}
+	nodes := 0
+	if _, err := toStarlark(1, 1, &nodes, 64, 0); err == nil {
+		t.Fatal("node cap ignored")
 	}
 }

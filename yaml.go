@@ -13,7 +13,9 @@ package yaml
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/1set/starlet"
@@ -128,7 +130,7 @@ func (m *Module) decode(thread *starlark.Thread, b *starlark.Builtin, args starl
 	// max_nodes bounds the materialized result, but neither bounds yaml.v3's
 	// super-linear PARSE time. The input is an immutable []byte, so running the
 	// parse in a goroutine shares nothing with an abandoned timeout goroutine.
-	parsed, err := unmarshalBounded(thread, m.maxTime(), []byte(text.GoString()))
+	parsed, err := unmarshalBounded(thread, m.maxTime(), []byte(text.GoString()), maxDepth, maxNodes)
 	if err != nil {
 		return none, err
 	}
@@ -142,7 +144,7 @@ func (m *Module) decode(thread *starlark.Thread, b *starlark.Builtin, args starl
 // goroutine; on timeout the abandoned goroutine keeps parsing until yaml.v3
 // finishes (a hard CPU bound needs an OS/sandbox limit), but it only reads the
 // immutable input, sharing nothing with the caller.
-func unmarshalBounded(thread *starlark.Thread, timeout float64, data []byte) (interface{}, error) {
+func unmarshalBounded(thread *starlark.Thread, timeout float64, data []byte, maxDepth, maxNodes int) (interface{}, error) {
 	ctx, cancel := util.OpContext(thread, util.DurationFromSeconds(timeout))
 	defer cancel()
 	if ctx.Err() != nil {
@@ -155,7 +157,7 @@ func unmarshalBounded(thread *starlark.Thread, timeout float64, data []byte) (in
 	}
 	ch := make(chan result, 1) // buffered so an abandoned goroutine never blocks
 	go func() {
-		v, err := unmarshal(data) // unmarshal recovers panics internally
+		v, err := unmarshalWithLimits(data, maxDepth, maxNodes) // unmarshal recovers panics internally
 		ch <- result{v, err}
 	}()
 
@@ -263,16 +265,22 @@ func checkIterableDepth(c starlark.Iterable, depth, maxDepth int) error {
 }
 
 // unmarshal parses YAML into a generic value, recovering panics into errors.
-func unmarshal(data []byte) (v interface{}, err error) {
+func unmarshal(data []byte) (interface{}, error) {
+	return unmarshalWithLimits(data, defaultMaxDepth, defaultMaxNodes)
+}
+
+func unmarshalWithLimits(data []byte, maxDepth, maxNodes int) (v interface{}, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			v, err = nil, fmt.Errorf("yaml.decode: parse panic: %v", r)
 		}
 	}()
-	if uerr := goyaml.Unmarshal(data, &v); uerr != nil {
+	var root goyaml.Node
+	if uerr := goyaml.Unmarshal(data, &root); uerr != nil {
 		return nil, fmt.Errorf("yaml.decode: %w", uerr)
 	}
-	return v, nil
+	walk := yamlWalk{maxDepth: maxDepth, maxNodes: maxNodes, active: make(map[*goyaml.Node]bool)}
+	return walk.value(&root, 1)
 }
 
 // marshal encodes a Go value to YAML, recovering panics into errors.
@@ -282,7 +290,7 @@ func marshal(v interface{}) (s string, err error) {
 			s, err = "", fmt.Errorf("yaml.encode: encode panic: %v", r)
 		}
 	}()
-	b, merr := goyaml.Marshal(v)
+	b, merr := goyaml.Marshal(exactEncodeValue(v))
 	if merr != nil {
 		return "", fmt.Errorf("yaml.encode: %w", merr)
 	}
@@ -336,6 +344,8 @@ func scalarToStarlark(v interface{}) (starlark.Value, bool) {
 // float64); ok is false for a non-numeric value.
 func numericToStarlark(v interface{}) (starlark.Value, bool) {
 	switch x := v.(type) {
+	case *big.Int:
+		return starlark.MakeBigInt(new(big.Int).Set(x)), true
 	case int:
 		return starlark.MakeInt(x), true
 	case int64:
@@ -413,4 +423,190 @@ func anyMapToStarlark(x map[interface{}]interface{}, depth int, nodes *int, maxD
 		}
 	}
 	return d, nil
+}
+
+// yamlWalk converts the syntax tree before yaml.v3 can narrow large integers to
+// float64. Limits apply while aliases and merges expand, before materialization.
+type yamlWalk struct {
+	maxDepth, maxNodes, nodes int
+	aliasDepth, aliasNodes    int
+	active                    map[*goyaml.Node]bool
+}
+
+type yamlMapKey struct{ kind, text string }
+
+func (k yamlMapKey) String() string { return k.text }
+
+func (w *yamlWalk) value(n *goyaml.Node, depth int) (interface{}, error) {
+	if n.Kind == 0 {
+		return nil, nil
+	}
+	if n.Kind == goyaml.DocumentNode {
+		return w.value(n.Content[0], depth)
+	}
+	if depth > w.maxDepth {
+		return nil, fmt.Errorf("yaml.decode: nesting exceeds max_depth (%d)", w.maxDepth)
+	}
+	w.nodes++
+	if w.aliasDepth > 0 {
+		w.aliasNodes++
+	}
+	// Preserve yaml.v3's amplification guard as well as the host node cap.
+	allowed := 0.99
+	if w.nodes > 400000 {
+		allowed -= 0.89 * float64(w.nodes-400000) / 3600000
+		if allowed < 0.10 {
+			allowed = 0.10
+		}
+	}
+	if w.nodes > 1000 && float64(w.aliasNodes)/float64(w.nodes) > allowed {
+		return nil, errors.New("yaml.decode: excessive aliasing")
+	}
+	if w.nodes > w.maxNodes {
+		return nil, fmt.Errorf("yaml.decode: node count exceeds max_nodes (%d)", w.maxNodes)
+	}
+	if w.active[n] {
+		return nil, errors.New("yaml.decode: cyclic alias")
+	}
+	w.active[n] = true
+	defer delete(w.active, n)
+	switch n.Kind {
+	case goyaml.AliasNode:
+		w.aliasDepth++
+		defer func() { w.aliasDepth-- }()
+		return w.value(n.Alias, depth)
+	case goyaml.ScalarNode:
+		return yamlScalar(n)
+	case goyaml.SequenceNode:
+		out := make([]interface{}, 0, len(n.Content))
+		for _, child := range n.Content {
+			v, err := w.value(child, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v)
+		}
+		return out, nil
+	case goyaml.MappingNode:
+		return w.mapping(n, depth)
+	}
+	return nil, errors.New("yaml.decode: unsupported node")
+}
+
+func yamlScalar(n *goyaml.Node) (interface{}, error) {
+	// Quoted numbers and explicitly tagged floats retain their declared types.
+	if n.Tag == "!!int" || (n.Style == 0 && (n.Tag == "!!str" || (n.Tag == "!!float" && !strings.ContainsAny(n.Value, ".eE")))) {
+		text := strings.ReplaceAll(n.Value, "_", "")
+		if value, ok := new(big.Int).SetString(text, 0); ok {
+			return value, nil
+		}
+		if value, ok := new(big.Int).SetString(text, 10); ok {
+			return value, nil
+		}
+	}
+	var value interface{}
+	if err := n.Decode(&value); err != nil {
+		return nil, fmt.Errorf("yaml.decode: %w", err)
+	}
+	return value, nil
+}
+
+func scalarKey(n *goyaml.Node) (yamlMapKey, error) {
+	if n.Kind == goyaml.AliasNode {
+		n = n.Alias
+	}
+	if n.Kind != goyaml.ScalarNode {
+		return yamlMapKey{}, errors.New("yaml.decode: non-scalar mapping key")
+	}
+	v, err := yamlScalar(n)
+	if err != nil {
+		return yamlMapKey{}, err
+	}
+	return yamlMapKey{kind: fmt.Sprintf("%T", v), text: fmt.Sprint(v)}, nil
+}
+
+func (w *yamlWalk) mapping(n *goyaml.Node, depth int) (interface{}, error) {
+	out := make(map[interface{}]interface{})
+	var merge *goyaml.Node
+	for i := 0; i < len(n.Content); i += 2 {
+		keyNode, valueNode := n.Content[i], n.Content[i+1]
+		if keyNode.Tag == "!!merge" {
+			if merge != nil {
+				return nil, errors.New("yaml.decode: duplicate merge key")
+			}
+			merge = valueNode
+			continue
+		}
+		key, err := scalarKey(keyNode)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := out[key]; duplicate {
+			return nil, fmt.Errorf("yaml.decode: mapping keys collide as %q", key.text)
+		}
+		v, err := w.value(valueNode, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = v
+	}
+	if merge != nil {
+		v, err := w.value(merge, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		sources, sequence := v.([]interface{})
+		if !sequence {
+			sources = []interface{}{v}
+		}
+		for _, source := range sources {
+			m, ok := source.(map[interface{}]interface{})
+			if !ok {
+				return nil, errors.New("yaml.decode: merge requires a mapping or sequence of mappings")
+			}
+			// Explicit keys win; among merge sources, the first occurrence wins.
+			for key, value := range m {
+				if _, exists := out[key]; !exists {
+					out[key] = value
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// exactYAMLInteger prevents yaml.v3 from treating big.Int's text marshaler as
+// a quoted string. It also works in container values and numeric mapping keys.
+type exactYAMLInteger string
+
+func (n exactYAMLInteger) MarshalYAML() (interface{}, error) {
+	return &goyaml.Node{Kind: goyaml.ScalarNode, Tag: "!!int", Value: string(n)}, nil
+}
+
+func exactEncodeValue(v interface{}) interface{} {
+	switch v := v.(type) {
+	case *big.Int:
+		return exactYAMLInteger(v.String())
+	case big.Int:
+		return exactYAMLInteger(v.String())
+	case []interface{}:
+		out := make([]interface{}, len(v))
+		for i, value := range v {
+			out[i] = exactEncodeValue(value)
+		}
+		return out
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(v))
+		for key, value := range v {
+			out[key] = exactEncodeValue(value)
+		}
+		return out
+	case map[interface{}]interface{}:
+		out := make(map[interface{}]interface{}, len(v))
+		for key, value := range v {
+			out[exactEncodeValue(key)] = exactEncodeValue(value)
+		}
+		return out
+	}
+	return v
 }

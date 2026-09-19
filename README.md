@@ -87,3 +87,8 @@ option table, defaults, and accessors.
 ## License
 
 MIT
+
+Integer decoding and encoding preserve arbitrary precision, including aliases,
+merge keys, nested containers, and round trips. Decimal/hex/binary/octal integer
+scalars become Starlark integers; quoted values and explicit floats retain their
+types. Colliding stringified keys are rejected. See [the API reference](docs/API.md#exact-integers-and-reference-expansion).
