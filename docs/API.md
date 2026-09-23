@@ -186,3 +186,17 @@ print(get_max_depth())   # 16
 # a document nested deeper than 16 now raises an error
 decode("a:\n  b:\n    c: 1")
 ```
+
+### Exact integers and reference expansion
+
+`decode` reads YAML syntax nodes before numeric narrowing. Decimal, binary,
+octal and hexadecimal integer scalars, including values beyond 64 bits, become
+exact Starlark `int` values. Quoted strings and explicitly tagged floats keep
+their declared types. `encode` emits large integers as YAML integers, so nested
+values and `decode(encode(value))` retain precision.
+
+Aliases preserve integer types. Explicit mapping entries override merged
+entries; the first mapping in a merge sequence wins. Duplicate keys and keys
+that collide after stringification are rejected, including large integer keys.
+Depth/node limits now apply during reference expansion, before allocating the
+expanded result. Cyclic and excessively amplified aliases remain errors.

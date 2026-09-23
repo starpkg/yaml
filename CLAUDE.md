@@ -36,9 +36,9 @@ The module is a thin, **single-file** bidirectional codec: `decode` parses YAML 
 - **`yaml.go`** — the whole module.
   - **`Module`** holds a `base.ConfigurableModule` (`cfgMod`) and its `Extend()` accessor (`ext`). `NewModule()` registers three int config options — `max_depth`, `max_nodes`, `max_input_bytes` — each with a `YAML_*` env var (built by `genConfigOption`, a generic helper over `base.NewConfigOption`).
   - **`LoadModule()`** registers exactly two script-facing builtins via `base.ConfigurableModule.LoadModule`: **`decode`** and **`encode`**. There are no object methods — `decode` returns plain Starlark containers/scalars, `encode` returns a `str`.
-  - **`decode`** (`m.decode`) unpacks a `text` arg (`types.StringOrBytes`), enforces `max_input_bytes` against the raw input length, calls `unmarshal`, then walks the result through `toStarlark` with a fresh node counter.
+  - **`decode`** (`m.decode`) unpacks a `text` arg (`types.StringOrBytes`), enforces `max_input_bytes` against the raw input length, parses `yaml.Node`, resolves exact scalars/aliases/merges through `yamlWalk` under the decode limits, then converts the bounded result with `toStarlark`.
   - **`encode`** (`m.encode`) unpacks a `value` arg, lowers it to a Go value with `dataconv.Unmarshal`, then calls `marshal`.
-  - **`unmarshal` / `marshal`** wrap `goyaml.Unmarshal` / `goyaml.Marshal` with a deferred `recover()` so a parser/encoder panic becomes a script-level error.
+  - **`unmarshal` / `marshal`** wrap syntax-node parsing / exact-integer-aware `goyaml.Marshal` with a deferred `recover()` so a parser/encoder panic becomes a script-level error.
   - **`toStarlark`** is the conversion core: a type switch over the decoded `interface{}` (`nil`/`bool`/`int`/`int64`/`uint64`/`float64`/`string`/`time.Time`/`[]interface{}`/`map[string]interface{}`/`map[interface{}]interface{}`) that recurses while threading `depth` and a `*nodes` counter and enforcing `maxDepth`/`maxNodes`. The default arm rejects any unhandled Go type as a `"unsupported value of type"` error.
   - **`upper`** is a small ASCII upper-caser used only to derive env-var names.
 
@@ -74,3 +74,13 @@ Three layers must stay in sync (enforced by the doc standard, `plan/starpkg文�
 - **CI** runs through the centralized reusable workflow in `1set/meta` (`.github/workflows/build.yml` references it by commit SHA), with `go-floor: "1.19"` and the doc-coverage gate enabled.
 - **Pin upgrade is the last PR of the series**: bump `go.starlark.net` + the `1set/*` deps + the go floor as one isolated PR, after all fixes; never tag before it merges.
 - **Bumping the version, the go floor, or tagging are user-confirmed actions** — never tag autonomously; default to patch bumps; published tags are immutable in the module proxy.
+
+### Exact integer node decoding (STAR-94)
+
+`yamlWalk` resolves the syntax tree before yaml.v3 can narrow integers to float64.
+It enforces depth/node bounds during alias/merge expansion, detects cycles, and
+retains the upstream amplification guard. `yamlMapKey` preserves scalar type
+identity through merges, so distinct types that stringify alike still fail the
+existing collision check. `exactEncodeValue` wraps big integers with an explicit
+YAML integer node for encoding, including keys and nested values. Keep the
+arbitrary-precision and full reference/limit contracts in `yaml_test.go`.
