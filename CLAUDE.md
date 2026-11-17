@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`starpkg/yaml` is an **L4 domain module** of the Star\* ecosystem: it exposes YAML decoding and encoding to Starlark scripts. A script loads the module and converts between YAML text and Starlark values (`dict`/`list`/`str`/`int`/`float`/`bool`/`None`).
+`starpkg/yaml` is an **L3 domain module** of the Star\* ecosystem: it exposes YAML decoding and encoding to Starlark scripts. A script loads the module and converts between YAML text and Starlark values (`dict`/`list`/`str`/`int`/`float`/`bool`/`None`).
 
 Positioning: **`starpkg` is support for necessary local operations plus simple abstractions over common online services, for ease of use.** `yaml` sits squarely on the **local** side — a pure in-process text↔value codec. There is no network, no filesystem, no external service; the only thing the host configures is how much work a decode is allowed to do.
 
