@@ -3,9 +3,9 @@ module github.com/starpkg/yaml
 go 1.19
 
 require (
-	github.com/1set/starlet v0.2.3
-	github.com/1set/starlight v0.2.1
-	github.com/starpkg/base v0.1.3
+	github.com/1set/starlet v0.2.5
+	github.com/1set/starlight v0.2.3
+	github.com/starpkg/base v0.1.4
 	go.starlark.net v0.0.0-20260324133313-ffb3f39dd27a
 	gopkg.in/yaml.v3 v3.0.1
 )
